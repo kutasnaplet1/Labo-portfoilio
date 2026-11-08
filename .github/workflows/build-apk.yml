@@ -1,0 +1,31 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-phone-tester
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        working-directory: ${{ github.workspace }}
+        run: unzip -q android-phone-tester.zip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npx expo prebuild --platform android --no-install
+      - run: ./gradlew assembleRelease --no-daemon
+        working-directory: android-phone-tester/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phone-tester-apk
+          path: android-phone-tester/android/app/build/outputs/apk/release/*.apk
