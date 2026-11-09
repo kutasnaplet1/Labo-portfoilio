@@ -1,0 +1,198 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: "Spike"
+  PACKAGE_NAME: "com.labo17dev.spike"
+  VERSION: "1.0.0"
+  VERSION_CODE: "1"
+  ICON_FILE: "assets/images/icon.png"
+  ICON_BG_COLOR: "#121217"
+  APK_FILE_NAME: "spike-android"
+  ARTIFACT_NAME: "spike-android-apk"
+  EXPO_PUBLIC_DOMAIN: "spike-labo17dev.replit.app"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Znajdź lub rozpakuj projekt Expo
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_root="$GITHUB_WORKSPACE"
+          archive=""
+
+          if [ ! -f "$source_root/app.json" ]; then
+            if [ -f "$source_root/spike-android.zip" ]; then
+              archive="$source_root/spike-android.zip"
+            else
+              mapfile -t archives < <(find "$source_root" -maxdepth 2 -type f -iname '*.zip' -not -path '*/.git/*' | sort)
+              if [ "${#archives[@]}" -eq 1 ]; then
+                archive="${archives[0]}"
+              fi
+            fi
+
+            if [ -n "$archive" ]; then
+              extract_dir="$RUNNER_TEMP/spike-android-source"
+              rm -rf "$extract_dir"
+              mkdir -p "$extract_dir"
+              python - "$archive" "$extract_dir" <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as bundle:
+              for entry in bundle.infolist():
+                  target = (destination / entry.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Niebezpieczna ścieżka w ZIP-ie: {entry.filename}")
+              bundle.extractall(destination)
+          PY
+              source_root="$extract_dir"
+            fi
+          fi
+
+          mapfile -t app_files < <(
+            find "$source_root" -maxdepth 6 -type f -name app.json \
+              -not -path '*/node_modules/*' \
+              -not -path '*/.git/*' \
+              -not -path '*/android/*' \
+              -not -path '*/.expo/*' | sort
+          )
+          if [ "${#app_files[@]}" -eq 0 ]; then
+            echo "::error::Nie znaleziono app.json. Dodaj pliki projektu do repozytorium albo umieść tam spike-android.zip."
+            exit 1
+          fi
+          if [ "${#app_files[@]}" -ne 1 ]; then
+            printf 'Znaleziono kilka plików app.json:\n%s\n' "${app_files[*]}" >&2
+            echo "::error::Workflow nie może jednoznacznie wybrać projektu Expo."
+            exit 1
+          fi
+
+          project_dir="$(dirname "${app_files[0]}")"
+          echo "SPIKE_PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+          echo "Znaleziono projekt Expo: $project_dir"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Ustaw nazwę, ikonę i wersję
+        run: |
+          node - <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const e = process.env;
+          const projectDir = e.SPIKE_PROJECT_DIR;
+          const appPath = path.join(projectDir, 'app.json');
+          const app = JSON.parse(fs.readFileSync(appPath, 'utf8'));
+          const x = app.expo;
+          x.android = x.android || {};
+          if (e.APP_NAME) x.name = e.APP_NAME;
+          if (e.PACKAGE_NAME) x.android.package = e.PACKAGE_NAME;
+          if (e.VERSION) x.version = e.VERSION;
+          if (e.VERSION_CODE) x.android.versionCode = Number(e.VERSION_CODE);
+          if (e.ICON_FILE) {
+            const source = path.resolve(projectDir, e.ICON_FILE);
+            const target = path.join(projectDir, 'assets/images/icon.png');
+            fs.mkdirSync(path.dirname(target), { recursive: true });
+            if (source !== target) fs.copyFileSync(source, target);
+            x.icon = './assets/images/icon.png';
+            x.android.adaptiveIcon = {
+              foregroundImage: './assets/images/adaptive-icon.png',
+              backgroundColor: e.ICON_BG_COLOR || '#121217'
+            };
+          }
+          fs.writeFileSync(appPath, JSON.stringify(app, null, 2));
+          JS
+
+      - name: Instalacja zależności
+        run: |
+          cd "$SPIKE_PROJECT_DIR"
+          npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Generowanie projektu Androida
+        run: |
+          cd "$SPIKE_PROJECT_DIR"
+          npx expo prebuild --platform android --no-install
+
+      - name: Przygotuj trwały podpis APK, jeśli ustawiono sekrety
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd "$SPIKE_PROJECT_DIR"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            KEYSTORE_PATH="$RUNNER_TEMP/spike-release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+            {
+              echo "SPIKE_KEYSTORE_PATH=$KEYSTORE_PATH"
+              echo "SPIKE_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "SPIKE_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "SPIKE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            cat >> android/app/build.gradle <<'GRADLE'
+
+          android {
+            signingConfigs {
+              release {
+                storeFile file(System.getenv("SPIKE_KEYSTORE_PATH"))
+                storePassword System.getenv("SPIKE_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("SPIKE_KEY_ALIAS")
+                keyPassword System.getenv("SPIKE_KEY_PASSWORD")
+              }
+            }
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+              }
+            }
+          }
+          GRADLE
+            echo "Używam stałego klucza wydania."
+          else
+            echo "::warning::Brak klucza wydania. APK będzie podpisany kluczem debug i Android może ostrzec przy instalacji."
+          fi
+
+      - name: Budowanie APK
+        run: |
+          cd "$SPIKE_PROJECT_DIR/android"
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Zbierz APK
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          found=0
+          for f in "$SPIKE_PROJECT_DIR"/android/app/build/outputs/apk/release/*.apk; do
+            [ -f "$f" ] || continue
+            cp "$f" "$GITHUB_WORKSPACE/out/$APK_FILE_NAME.apk"
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Nie znaleziono APK w katalogu release." >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out/*.apk
